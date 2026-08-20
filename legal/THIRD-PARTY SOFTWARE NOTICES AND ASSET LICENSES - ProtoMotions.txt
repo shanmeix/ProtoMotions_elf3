@@ -33,7 +33,21 @@ terms before use.
 
    License: BSD-3-Clause
 
-3. BeyondMimic
+3. BXI ELF3 robot description and mesh assets
+
+   Applied to:
+   - protomotions/data/assets/mesh/ELF3/
+   - protomotions/data/assets/mjcf/elf3.xml
+
+   Copyright:
+   - Copyright (c) 2021-2024, The RSL-RL Project Developers
+   - Copyright (c) 2022-2025, The Isaac Lab Project Developers
+   - Copyright (c) 2025-2026, The Legged Lab Project Developers
+   - Copyright (c) 2025-2026, The TienKung-Lab Project Developers
+
+   License: BSD-3-Clause
+
+4. BeyondMimic
 
    Applied to:
    - BeyondMimic-style tracking/deployment configuration and documentation,
@@ -46,7 +60,7 @@ terms before use.
 
    License: MIT
 
-4. SMPL and SMPL-H body model assets
+5. SMPL and SMPL-H body model assets
 
    Applied to:
    - data/smpl/

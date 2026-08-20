@@ -11,8 +11,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-FPS = 30
-
 # Parse arguments first (argparse is safe, doesn't import torch)
 parser = argparse.ArgumentParser(
     description="Motion Visualizer with Smoothness Metrics"
@@ -22,7 +20,7 @@ parser.add_argument(
     type=str,
     nargs="+",
     required=True,
-    help="Paths to MotionLib .pt files (e.g., predicted_motion_lib.pt motion_lib.pt). Each file will be displayed in a separate environment.",
+    help="Paths to MotionLib .pt or .motion files. Each file will be displayed in a separate environment.",
 )
 parser.add_argument(
     "--simulator",
@@ -34,9 +32,9 @@ parser.add_argument(
 parser.add_argument(
     "--robot",
     type=str,
-    choices=["g1", "h1_2", "smpl", "soma23"],
+    choices=["g1", "h1_2", "smpl", "soma23", "elf3"],
     default="g1",
-    help="Robot to load (g1, h1_2, smpl, or soma23)",
+    help="Robot to load (g1, h1_2, smpl, soma23, or elf3)",
 )
 parser.add_argument("--headless", action="store_true", help="Run in headless mode")
 parser.add_argument(
@@ -135,6 +133,9 @@ ROBOT_SPECS = {
         viz_bodies=[],
     ),
     "soma23": RobotSpec(
+        viz_bodies=[],
+    ),
+    "elf3": RobotSpec(
         viz_bodies=[],
     ),
 }
@@ -322,12 +323,14 @@ class MotionVisualizerSmoothness:
         self.num_envs = len(motion_files)
         self.simulator_type = simulator_type
         self.headless = headless
+        if playback_speed <= 0.0:
+            raise ValueError("playback_speed must be positive")
         self.playback_speed = playback_speed
         self.device = torch.device("cuda:0" if not cpu_only else "cpu")
         self.smoothness_threshold = args.smoothness_threshold
         self.metric = metric
         self.use_data_vel = use_data_vel  # If False (default), use finite differences
-        self.window_frames = max(4, int(round(window_sec * FPS)))
+        self.window_sec = window_sec
 
         # Load motion libraries (.pt files)
         from protomotions.components.motion_lib import MotionLibConfig
@@ -349,13 +352,21 @@ class MotionVisualizerSmoothness:
         # Motion playback state
         self.current_motion_idx = 0
         self.current_frame = 0
+        self.frame_accumulator = 0.0
         # Use the first motion lib to determine total motions and current motion length
         self.total_motions = self.motion_libs[0].num_motions()
+        motion_counts = [motion_lib.num_motions() for motion_lib in self.motion_libs]
+        if any(count != self.total_motions for count in motion_counts[1:]):
+            raise ValueError(
+                "All motion libraries displayed together must have the same "
+                f"number of motions; got {motion_counts}."
+            )
         self.current_motion_length = (
             self.motion_libs[0]
             .get_motion_num_frames(None)[self.current_motion_idx]
             .item()
         )
+        self._update_motion_timing()
 
         print(
             f"Loaded {len(self.motion_files)} motion files with {self.total_motions} motions each"
@@ -363,6 +374,10 @@ class MotionVisualizerSmoothness:
         print(f"Motion files: {[str(f) for f in self.motion_files]}")
         print(
             f"Current motion {self.current_motion_idx} has {self.current_motion_length} frames"
+        )
+        print(
+            f"Motion timing: {1.0 / self.current_motion_dt:.3f} FPS "
+            f"(dt={self.current_motion_dt:.6f}s)"
         )
 
         # Load robot configuration using factory function
@@ -448,7 +463,7 @@ class MotionVisualizerSmoothness:
         print("  '4' - Decrease smoothness threshold by 1.5x (NumPad 4 for IsaacLab)")
         print("Motion will play automatically and loop")
 
-        self.simulator.user_requested_reset = True
+        self.simulator.user_requested_reset = False
 
         # Speed control state
         self.speed_change_factor = 1.5  # 150% speed change
@@ -520,19 +535,54 @@ class MotionVisualizerSmoothness:
         callback fired from inside the viewer's event poll."""
         self.simulator.user_requested_reset = True
 
+    def _update_motion_timing(self):
+        """Use the selected motion's stored timestep for metrics and playback."""
+        motion_frame_counts = [
+            int(motion_lib.motion_num_frames[self.current_motion_idx].item())
+            for motion_lib in self.motion_libs
+        ]
+        if any(
+            count != motion_frame_counts[0] for count in motion_frame_counts[1:]
+        ):
+            raise ValueError(
+                "Corresponding motions displayed together must have the same "
+                f"frame count; got {motion_frame_counts} for motion "
+                f"{self.current_motion_idx}."
+            )
+        motion_dts = [
+            float(motion_lib.motion_dt[self.current_motion_idx].item())
+            for motion_lib in self.motion_libs
+        ]
+        reference_dt = motion_dts[0]
+        if reference_dt <= 0.0:
+            raise ValueError(f"Motion timestep must be positive; got {reference_dt}")
+        if any(abs(dt - reference_dt) > 1.0e-7 for dt in motion_dts[1:]):
+            raise ValueError(
+                "All motions displayed together must have the same timestep; "
+                f"got {motion_dts}."
+            )
+        self.current_motion_dt = reference_dt
+        self.window_frames = max(
+            4,
+            int(round(self.window_sec / self.current_motion_dt)),
+        )
+
     def _switch_to_next_motion(self):
         """Switch to the next motion in the dataset"""
         self.current_motion_idx = (self.current_motion_idx + 1) % self.total_motions
         self.current_frame = 0
+        self.frame_accumulator = 0.0
         self.current_motion_length = (
             self.motion_libs[0]
             .get_motion_num_frames(None)[self.current_motion_idx]
             .item()
         )
+        self._update_motion_timing()
 
         print(
             f"Switched to motion {self.current_motion_idx}/{self.total_motions-1} "
-            f"(length: {self.current_motion_length} frames)"
+            f"(length: {self.current_motion_length} frames, "
+            f"FPS: {1.0 / self.current_motion_dt:.3f})"
         )
         print(
             f"Current motion: {self.motion_libs[0].motion_files[self.current_motion_idx]}"
@@ -547,7 +597,7 @@ class MotionVisualizerSmoothness:
         motion_idx = torch.tensor(
             [self.current_motion_idx], device=self.device, dtype=torch.long
         )
-        dt = 1.0 / FPS
+        dt = self.current_motion_dt
 
         # Load all frames for all environments
         all_positions = []
@@ -869,10 +919,6 @@ class MotionVisualizerSmoothness:
 
     def run(self):
         """Main simulation loop"""
-        step_count = 0
-        marker_states = None
-        target_dt = 1.0 / FPS  # wall-clock time per motion frame
-
         while True:
             frame_start = time.perf_counter()
 
@@ -881,48 +927,37 @@ class MotionVisualizerSmoothness:
                 self._switch_to_next_motion()
                 self.simulator.user_requested_reset = False
 
-            # Calculate playback parameters based on speed
-            # For speed < 1.0: slow down by updating motion less frequently (frames_per_step > 1)
-            # For speed >= 1.0: speed up by skipping motion frames (frame_skip > 1)
-            if self.playback_speed < 1.0:
-                frames_per_step = max(1, int(1.0 / self.playback_speed))
-                frame_skip = 1  # Don't skip frames when slowing down
-            else:
-                frames_per_step = 1  # Update every step when speeding up
-                frame_skip = max(
-                    1, int(self.playback_speed)
-                )  # Skip frames for fast playback
+            target_dt = self.current_motion_dt
+            self.frame_accumulator += self.playback_speed
+            frames_to_advance = int(self.frame_accumulator)
+            self.frame_accumulator -= frames_to_advance
 
-            # Update motion frame based on playback speed
-            if step_count % frames_per_step == 0:
-                # Get current pose for display
-                dof_pos, rigid_body_pos, rigid_body_rot, _ = self._get_current_pose()
+            # Re-apply the current kinematic pose on every display tick so that
+            # sub-1x playback cannot drift during held frames.
+            dof_pos, rigid_body_pos, rigid_body_rot, _ = self._get_current_pose()
+            self._set_robot_pose(dof_pos, rigid_body_pos, rigid_body_rot)
 
-                # Set robot pose
-                self._set_robot_pose(dof_pos, rigid_body_pos, rigid_body_rot)
+            # Pose, contacts, and smoothness markers must all use the same
+            # current_frame. Build marker state before advancing the index.
+            marker_states = self._get_updated_marker_positions()
 
-                # Advance frame with skip for fast playback
-                self.current_frame += frame_skip
-
-                # Loop motion when finished
-                if self.current_frame >= self.current_motion_length:
-                    self.current_frame = 0
+            # A fractional accumulator gives accurate non-integer speeds
+            # without applying the speed multiplier twice to wall time.
+            self.current_frame = (
+                self.current_frame + frames_to_advance
+            ) % self.current_motion_length
 
             # Zero torque control to maintain pose
             _common_actions = torch.zeros(
                 self.num_envs, self.kinematic_info.num_dofs, device=self.device
             )
 
-            if marker_states is None or step_count % frames_per_step == 0:
-                marker_states = self._get_updated_marker_positions()
-
             self.simulator.step(_common_actions, markers_callback=lambda: marker_states)
 
-            step_count += 1
-
-            # Throttle to real-time (adjusted by playback speed)
+            # Run display updates at the motion's native frame interval. The
+            # frame accumulator above controls playback speed.
             elapsed = time.perf_counter() - frame_start
-            sleep_time = target_dt / max(self.playback_speed, 0.01) - elapsed
+            sleep_time = target_dt - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
@@ -939,6 +974,10 @@ def main():
         app_launcher_flags = {
             "headless": args.headless,
             "device": str(device),
+            # Current Isaac Lab releases require an explicit visualizer intent;
+            # headless=False alone no longer enables the Kit viewport.
+            "visualizer": ["none"] if args.headless else ["kit"],
+            "visualizer_explicit": True,
             # # Performance settings for faster-than-realtime rendering
             # "rendering_mode": "performance",  # Options: "performance", "balanced", "quality"
         }

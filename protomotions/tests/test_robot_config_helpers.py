@@ -172,15 +172,98 @@ def test_robot_config_factory_dispatches_all_robot_names_and_applies_updates(mon
         ("protomotions.robot_configs.g1", "G1RobotConfig"),
         ("protomotions.robot_configs.h1_2", "H1_2RobotConfig"),
         ("protomotions.robot_configs.soma23", "Soma23RobotConfig"),
+        ("protomotions.robot_configs.elf3", "Elf3RobotConfig"),
     ]:
         module = types.ModuleType(module_name)
         setattr(module, class_name, _FactoryConfig)
         monkeypatch.setitem(sys.modules, module_name, module)
 
-    for name in ["smpl", "smplx", "amp", "g1", "h1_2", "soma23"]:
+    for name in ["smpl", "smplx", "amp", "g1", "h1_2", "soma23", "elf3"]:
         config = robot_config(name, trackable_bodies_subset=["root"])
         assert isinstance(config, _FactoryConfig)
         assert config.updates == {"trackable_bodies_subset": ["root"]}
 
     with pytest.raises(ValueError, match="Invalid robot name"):
         robot_config("unknown")
+
+
+def test_elf3_robot_config_contract():
+    config = robot_config("elf3")
+    expected_dof_names = [
+        "waist_y_joint",
+        "waist_x_joint",
+        "waist_z_joint",
+        "l_hip_y_joint",
+        "l_hip_x_joint",
+        "l_hip_z_joint",
+        "l_knee_y_joint",
+        "l_ankle_y_joint",
+        "l_ankle_x_joint",
+        "r_hip_y_joint",
+        "r_hip_x_joint",
+        "r_hip_z_joint",
+        "r_knee_y_joint",
+        "r_ankle_y_joint",
+        "r_ankle_x_joint",
+        "l_shoulder_y_joint",
+        "l_shoulder_x_joint",
+        "l_shoulder_z_joint",
+        "l_elbow_y_joint",
+        "l_wrist_x_joint",
+        "l_wrist_y_joint",
+        "l_wrist_z_joint",
+        "r_shoulder_y_joint",
+        "r_shoulder_x_joint",
+        "r_shoulder_z_joint",
+        "r_elbow_y_joint",
+        "r_wrist_x_joint",
+        "r_wrist_y_joint",
+        "r_wrist_z_joint",
+    ]
+
+    assert config.kinematic_info.dof_names == expected_dof_names
+    assert config.kinematic_info.num_dofs == config.number_of_actions == 29
+    assert config.kinematic_info.num_bodies == 30
+    assert config.anchor_body_name == "torso_link"
+    assert config.anchor_body_index == 0
+    assert config.default_root_height == pytest.approx(1.05)
+    assert config.control.control_type is ControlType.BUILT_IN_PD
+    assert set(config.control.control_info) == set(expected_dof_names)
+
+    expected_aliases = {
+        "all_left_foot_bodies": ["l_ankle_x_link"],
+        "all_right_foot_bodies": ["r_ankle_x_link"],
+        "all_left_hand_bodies": ["l_wrist_z_link"],
+        "all_right_hand_bodies": ["r_wrist_z_link"],
+        "head_body_name": ["torso_link"],
+        "torso_body_name": ["torso_link"],
+    }
+    assert config.common_naming_to_robot_body_names == expected_aliases
+    assert len(config.trackable_bodies_subset) == 14
+    assert len(set(config.trackable_bodies_subset)) == 14
+    assert set(config.trackable_bodies_subset) <= set(config.kinematic_info.body_names)
+
+    expected_default_pos = {
+        "l_hip_y_joint": -0.3,
+        "r_hip_y_joint": -0.3,
+        "l_knee_y_joint": 0.6,
+        "r_knee_y_joint": 0.6,
+        "l_ankle_y_joint": -0.3,
+        "r_ankle_y_joint": -0.3,
+        "l_shoulder_y_joint": 0.2,
+        "r_shoulder_y_joint": 0.2,
+        "l_shoulder_x_joint": 0.2,
+        "r_shoulder_x_joint": -0.2,
+        "l_elbow_y_joint": 0.6,
+        "r_elbow_y_joint": 0.6,
+    }
+    for index, dof_name in enumerate(expected_dof_names):
+        expected = expected_default_pos.get(dof_name, 0.0)
+        assert config.default_dof_pos[index].item() == pytest.approx(expected)
+
+    for control_info in config.control.control_info.values():
+        assert control_info.stiffness is not None and control_info.stiffness > 0
+        assert control_info.damping is not None and control_info.damping > 0
+        assert control_info.effort_limit is not None and control_info.effort_limit > 0
+        assert control_info.velocity_limit is not None and control_info.velocity_limit > 0
+        assert control_info.armature is not None and control_info.armature > 0
