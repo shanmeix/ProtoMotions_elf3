@@ -108,7 +108,16 @@ def test_resolver_returns_no_actuators_for_empty_control_info(control_type):
 
 
 def test_single_actuator_specs_cover_public_robots():
-    for robot_name in ("amp", "smpl", "smplx", "g1", "h1_2", "soma23", "elf3"):
+    for robot_name in (
+        "amp",
+        "smpl",
+        "smplx",
+        "g1",
+        "h1_2",
+        "soma23",
+        "elf3",
+        "elf3_bxi",
+    ):
         control_info = robot_config(robot_name).control.control_info
         escaped_to_dof = {re.escape(name): name for name in control_info}
 

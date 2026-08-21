@@ -135,7 +135,7 @@ def test_apply_all_inference_overrides_delegates_to_experiment_hook(caplog):
     assert configs[0].name == "updated"
 
 
-def test_apply_all_inference_overrides_ignores_missing_inputs_and_logs_failures(caplog):
+def test_apply_all_inference_overrides_ignores_missing_inputs_and_propagates_failures():
     configs = [SimpleNamespace() for _ in range(7)]
     called = False
 
@@ -153,13 +153,14 @@ def test_apply_all_inference_overrides_ignores_missing_inputs_and_logs_failures(
     def failing_override(*values):
         raise RuntimeError("bad override")
 
-    apply_all_inference_overrides(
-        *configs,
-        experiment_module=SimpleNamespace(apply_inference_overrides=failing_override),
-        args=SimpleNamespace(),
-    )
-
-    assert "Failed to apply experiment inference overrides: bad override" in caplog.text
+    with pytest.raises(RuntimeError, match="bad override"):
+        apply_all_inference_overrides(
+            *configs,
+            experiment_module=SimpleNamespace(
+                apply_inference_overrides=failing_override
+            ),
+            args=SimpleNamespace(),
+        )
 
 
 def test_import_simulator_before_torch_handles_supported_names(monkeypatch):

@@ -173,12 +173,22 @@ def test_robot_config_factory_dispatches_all_robot_names_and_applies_updates(mon
         ("protomotions.robot_configs.h1_2", "H1_2RobotConfig"),
         ("protomotions.robot_configs.soma23", "Soma23RobotConfig"),
         ("protomotions.robot_configs.elf3", "Elf3RobotConfig"),
+        ("protomotions.robot_configs.elf3_bxi", "Elf3BxiRobotConfig"),
     ]:
         module = types.ModuleType(module_name)
         setattr(module, class_name, _FactoryConfig)
         monkeypatch.setitem(sys.modules, module_name, module)
 
-    for name in ["smpl", "smplx", "amp", "g1", "h1_2", "soma23", "elf3"]:
+    for name in [
+        "smpl",
+        "smplx",
+        "amp",
+        "g1",
+        "h1_2",
+        "soma23",
+        "elf3",
+        "elf3_bxi",
+    ]:
         config = robot_config(name, trackable_bodies_subset=["root"])
         assert isinstance(config, _FactoryConfig)
         assert config.updates == {"trackable_bodies_subset": ["root"]}
@@ -267,3 +277,81 @@ def test_elf3_robot_config_contract():
         assert control_info.effort_limit is not None and control_info.effort_limit > 0
         assert control_info.velocity_limit is not None and control_info.velocity_limit > 0
         assert control_info.armature is not None and control_info.armature > 0
+
+
+def test_elf3_bxi_robot_config_contract():
+    config = robot_config("elf3_bxi")
+    elf3_config = robot_config("elf3")
+
+    assert config.asset.asset_file_name == "mjcf/elf3_bxi.xml"
+    assert config.kinematic_info.dof_names == elf3_config.kinematic_info.dof_names
+    assert config.kinematic_info.body_names == elf3_config.kinematic_info.body_names
+    assert config.kinematic_info.num_dofs == config.number_of_actions == 29
+    assert config.kinematic_info.num_bodies == 30
+    assert config.anchor_body_name == elf3_config.anchor_body_name == "torso_link"
+    assert config.anchor_body_index == elf3_config.anchor_body_index == 0
+    assert config.semantic_forward_axis_xy == elf3_config.semantic_forward_axis_xy
+    assert config.common_naming_to_robot_body_names == (
+        elf3_config.common_naming_to_robot_body_names
+    )
+    assert config.trackable_bodies_subset == elf3_config.trackable_bodies_subset
+    assert torch.equal(config.default_dof_pos, elf3_config.default_dof_pos)
+
+    expected_effort_limits = {
+        "waist_y_joint": 100.0,
+        "waist_x_joint": 100.0,
+        "waist_z_joint": 150.0,
+        ".*_hip_(y|x)_joint": 150.0,
+        ".*_hip_z_joint": 50.0,
+        ".*_knee_y_joint": 150.0,
+        ".*_ankle_y_joint": 50.0,
+        ".*_ankle_x_joint": 20.0,
+        ".*_shoulder_(y|x)_joint": 50.0,
+        ".*_shoulder_z_joint": 25.0,
+        ".*_elbow_y_joint": 50.0,
+        ".*_wrist_(x|y|z)_joint": 25.0,
+    }
+    assert set(config.control.override_control_info) == set(expected_effort_limits)
+    for pattern, expected_limit in expected_effort_limits.items():
+        bxi_control = config.control.override_control_info[pattern]
+        elf3_control = elf3_config.control.override_control_info[pattern]
+        assert bxi_control.effort_limit == pytest.approx(expected_limit)
+        assert bxi_control.stiffness == pytest.approx(elf3_control.stiffness)
+        assert bxi_control.damping == pytest.approx(elf3_control.damping)
+        assert bxi_control.armature == pytest.approx(elf3_control.armature)
+        assert bxi_control.velocity_limit == pytest.approx(
+            elf3_control.velocity_limit
+        )
+
+    assert config.simulation_params.isaacgym == elf3_config.simulation_params.isaacgym
+    assert config.simulation_params.genesis == elf3_config.simulation_params.genesis
+    assert config.simulation_params.newton == elf3_config.simulation_params.newton
+    assert (
+        config.simulation_params.isaaclab.physx
+        == elf3_config.simulation_params.isaaclab.physx
+    )
+    assert config.simulation_params.isaaclab.fps == 500
+    assert config.simulation_params.isaaclab.decimation == 10
+    assert config.simulation_params.mujoco.fps == 500
+    assert config.simulation_params.mujoco.decimation == 10
+    assert (
+        config.simulation_params.isaaclab.decimation
+        / config.simulation_params.isaaclab.fps
+        == pytest.approx(0.02)
+    )
+    assert (
+        config.simulation_params.mujoco.decimation
+        / config.simulation_params.mujoco.fps
+        == pytest.approx(0.02)
+    )
+
+    # Every dataclass default factory must return independent mutable objects.
+    second = robot_config("elf3_bxi")
+    assert second.asset is not config.asset
+    assert second.control is not config.control
+    assert second.control.override_control_info is not (
+        config.control.override_control_info
+    )
+    assert second.simulation_params is not config.simulation_params
+    assert second.simulation_params.isaaclab is not config.simulation_params.isaaclab
+    assert second.simulation_params.mujoco is not config.simulation_params.mujoco

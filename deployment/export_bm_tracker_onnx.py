@@ -171,6 +171,122 @@ class MockContext:
         self.ground_heights = torch.zeros(num_envs)
 
 
+def _canonicalize_deployment_context_path(field_path):
+    """Return the single-state deployment binding for a training field path.
+
+    Training may expose separate clean and noisy state views. The exported
+    deployment graph receives one measured state, so noisy view bindings must
+    share the canonical clean input names expected by deployment consumers.
+    """
+
+    path = field_path.path
+    if path.startswith("noisy."):
+        canonical_path = f"current.{path.removeprefix('noisy.')}"
+    elif path.startswith("noisy_historical."):
+        canonical_path = f"historical.{path.removeprefix('noisy_historical.')}"
+    elif path == "noisy_ground_heights":
+        canonical_path = "ground_heights"
+    else:
+        return field_path
+
+    from protomotions.envs.context_views import EnvContext
+
+    field_path = EnvContext
+    for attr in canonical_path.split("."):
+        field_path = getattr(field_path, attr)
+    return field_path
+
+
+def _is_training_only_noisy_path(field_path) -> bool:
+    path = field_path.path
+    return (
+        path.startswith("noisy.")
+        or path.startswith("noisy_historical.")
+        or path == "noisy_ground_heights"
+    )
+
+
+def _canonicalize_deployment_observation_configs(
+    actor_observation_configs,
+    *,
+    all_observation_configs=None,
+    obs_pairs=None,
+):
+    """Build deployment observation components without mutating frozen configs.
+
+    L2C2 checkpoints record the clean counterpart for every noisy actor
+    observation in ``obs_pairs``.  Prefer that exact clean component while
+    retaining the actor's original dictionary key.  This reproduces the base
+    experiment's inference override even for stale inference bundles that were
+    saved before that hook ran.  Unpaired noisy views fall back to canonical
+    single-state deployment paths.
+    """
+
+    from copy import copy
+
+    all_observation_configs = (
+        actor_observation_configs
+        if all_observation_configs is None
+        else all_observation_configs
+    )
+    obs_pairs = {} if obs_pairs is None else dict(obs_pairs)
+
+    canonicalized = {}
+    for actor_key, actor_component in actor_observation_configs.items():
+        actor_noisy_paths = [
+            field_path.path
+            for field_path in actor_component.dynamic_vars.values()
+            if _is_training_only_noisy_path(field_path)
+        ]
+        source_component = actor_component
+        clean_key = obs_pairs.get(actor_key)
+        if clean_key is not None:
+            clean_component = all_observation_configs.get(clean_key)
+            if clean_component is not None:
+                source_component = clean_component
+            elif actor_noisy_paths:
+                raise ValueError(
+                    f"L2C2 obs_pairs maps actor observation {actor_key!r} to "
+                    f"missing clean observation component {clean_key!r}"
+                )
+
+        if actor_noisy_paths:
+            clean_source = (
+                f"L2C2 clean component {clean_key!r}"
+                if clean_key is not None
+                else "canonical current-state paths"
+            )
+            log.warning(
+                "Frozen inference bundle still contains training-only noisy "
+                "bindings for %r (%s); using %s in memory without modifying "
+                "the saved config",
+                actor_key,
+                ", ".join(actor_noisy_paths),
+                clean_source,
+            )
+
+        component_copy = copy(source_component)
+        if clean_key is None:
+            component_copy.dynamic_vars = {
+                arg_name: _canonicalize_deployment_context_path(field_path)
+                for arg_name, field_path in source_component.dynamic_vars.items()
+            }
+        else:
+            component_copy.dynamic_vars = dict(source_component.dynamic_vars)
+            noisy_paths = [
+                field_path.path
+                for field_path in component_copy.dynamic_vars.values()
+                if _is_training_only_noisy_path(field_path)
+            ]
+            if noisy_paths:
+                raise ValueError(
+                    f"L2C2 clean observation component {clean_key!r} still uses "
+                    f"noisy context paths: {noisy_paths}"
+                )
+        canonicalized[actor_key] = component_copy
+    return canonicalized
+
+
 # ---------------------------------------------------------------------------
 # Main export logic
 # ---------------------------------------------------------------------------
@@ -326,17 +442,23 @@ def export_tracker(
     # ------------------------------------------------------------------
     # 5. Build ObservationExportModule (actor obs only, for export)
     # ------------------------------------------------------------------
-    actor_obs_configs = {
-        k: v
-        for k, v in env_config.observation_components.items()
-        if k in actor_obs_keys
-    }
     missing = actor_obs_keys - set(env_config.observation_components.keys())
     if missing:
         raise ValueError(
             f"Actor requires obs keys {actor_obs_keys} but these are missing "
             f"from env_config.observation_components: {missing}"
         )
+    l2c2_config = getattr(agent_config, "l2c2", None)
+    l2c2_obs_pairs = getattr(l2c2_config, "obs_pairs", None)
+    actor_obs_configs = _canonicalize_deployment_observation_configs(
+        {
+            k: v
+            for k, v in env_config.observation_components.items()
+            if k in actor_obs_keys
+        },
+        all_observation_configs=env_config.observation_components,
+        obs_pairs=l2c2_obs_pairs,
+    )
 
     log.info(f"Observation components for export: {list(actor_obs_configs.keys())}")
     obs_module = ObservationExportModule(actor_obs_configs, mock, device="cpu")
