@@ -91,8 +91,9 @@ def compute_heading_velocity_rew(
         -vel_err_scale * (tar_vel_err * tar_vel_err + tangent_err_w * tangent_vel_err)
     )
 
-    # Zero reward for moving backwards
-    speed_mask = tar_dir_speed <= 0
+    # Only suppress non-forward motion when the command actually asks the
+    # robot to move. Zero velocity is the exact target for a stop command.
+    speed_mask = (tar_speed > 1.0e-4) & (tar_dir_speed <= 0)
     dir_reward[speed_mask] = 0
 
     # Facing reward: robot should face the target facing direction

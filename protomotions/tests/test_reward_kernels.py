@@ -295,6 +295,21 @@ def test_task_rewards_cover_direction_path_target_and_object_terms():
     assert torch.allclose(heading_reward[1], torch.tensor(0.3))
     assert heading_reward[2] < 0.7
 
+    stop_reward = task.compute_heading_velocity_rew(
+        root_pos=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [-0.1, 0.0, 0.0]]
+        ),
+        prev_root_pos=torch.zeros(3, 3),
+        root_rot=root_rot,
+        tar_dir=torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]),
+        tar_speed=torch.zeros(3),
+        tar_face_dir=torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 0.0]]),
+        dt=1.0,
+    )
+    assert torch.allclose(stop_reward[0], torch.tensor(1.0))
+    assert stop_reward[0] > stop_reward[1]
+    assert stop_reward[0] > stop_reward[2]
+
     assert torch.allclose(
         task.compute_path_following_rew(
             head_pos=torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 1.0]]),

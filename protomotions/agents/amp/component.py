@@ -41,11 +41,19 @@ class AMPTrainingComponent:
             device=agent.device,
         )
         rollout_size = agent.num_envs * agent.num_steps
-        disc_bs = agent.config.amp_parameters.discriminator_batch_size
-        if disc_bs <= rollout_size:
-            assert disc_bs * agent.max_num_batches() <= rollout_size, (
-                f"Discriminator needs {disc_bs} × {agent.max_num_batches()} = "
-                f"{disc_bs * agent.max_num_batches()} expert samples per epoch, "
+        effective_discriminator_batch_size = min(
+            agent.config.amp_parameters.discriminator_batch_size,
+            agent.config.batch_size,
+        )
+        if effective_discriminator_batch_size <= rollout_size:
+            assert (
+                effective_discriminator_batch_size * agent.max_num_batches()
+                <= rollout_size
+            ), (
+                "Discriminator needs "
+                f"{effective_discriminator_batch_size} × {agent.max_num_batches()} = "
+                f"{effective_discriminator_batch_size * agent.max_num_batches()} "
+                "expert samples per epoch, "
                 f"but rollout only has {rollout_size} entries. "
                 f"Reduce discriminator_batch_size or increase num_envs/num_steps."
             )
@@ -195,8 +203,14 @@ class AMPTrainingComponent:
         else:
             replay_disc_obs = self.replay_buffer.sample(num_samples)
 
-        disc_bs = self.config.amp_parameters.discriminator_batch_size
-        num_expert = min(num_samples, disc_bs * self.agent.max_num_batches())
+        effective_discriminator_batch_size = min(
+            self.config.amp_parameters.discriminator_batch_size,
+            self.config.batch_size,
+        )
+        num_expert = min(
+            num_samples,
+            effective_discriminator_batch_size * self.agent.max_num_batches(),
+        )
         expert_disc_obs = self.agent.get_expert_disc_obs(num_expert)
 
         discriminator_training_data_dict = {}
@@ -550,9 +564,12 @@ class AMPTrainingComponent:
                 expert_obs[key.replace("expert_", "")] = val
                 expert_obs[key.replace("expert_", "")].requires_grad_(True)
 
+        # DictDataset slices every source with the PPO minibatch size.  The
+        # configured discriminator batch size is only an upper bound here and
+        # can therefore be larger than the tensors in this optimization step.
         expert_obs_td = TensorDict(
             expert_obs,
-            batch_size=self.config.amp_parameters.discriminator_batch_size,
+            batch_size=next(iter(expert_obs.values())).shape[0],
         )
         with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
             expert_obs_td = self.discriminator(expert_obs_td)
@@ -563,14 +580,14 @@ class AMPTrainingComponent:
 
         agent_obs_td = TensorDict(
             agent_obs,
-            batch_size=self.config.amp_parameters.discriminator_batch_size,
+            batch_size=next(iter(agent_obs.values())).shape[0],
         )
         agent_obs_td = self.discriminator(agent_obs_td)
         agent_logits = agent_obs_td[self.discriminator.module.config.out_keys[0]]
 
         replay_obs_td = TensorDict(
             replay_obs,
-            batch_size=self.config.amp_parameters.discriminator_batch_size,
+            batch_size=next(iter(replay_obs.values())).shape[0],
         )
         replay_obs_td = self.discriminator(replay_obs_td)
         replay_logits = replay_obs_td[self.discriminator.module.config.out_keys[0]]
@@ -578,7 +595,7 @@ class AMPTrainingComponent:
         if negative_expert_obs is not None:
             negative_expert_obs_td = TensorDict(
                 negative_expert_obs,
-                batch_size=self.config.amp_parameters.discriminator_batch_size,
+                batch_size=next(iter(negative_expert_obs.values())).shape[0],
             )
             negative_expert_obs_td = self.discriminator(negative_expert_obs_td)
             negative_expert_logits = negative_expert_obs_td[

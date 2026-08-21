@@ -443,6 +443,30 @@ def test_amp_init_exposes_reusable_training_component(monkeypatch):
     assert not hasattr(agent, "use_disc_critic")
 
 
+def test_amp_init_caps_discriminator_batch_to_ppo_minibatch(monkeypatch):
+    def fake_ppo_init(self, fabric, env, config, root_dir=None):
+        self.fabric = fabric
+        self.env = env
+        self.config = config
+        self.device = torch.device("cpu")
+        self.num_envs = 2
+        self.num_steps = 3
+        self.num_mini_epochs = 1
+        self.gamma = 0.95
+
+    monkeypatch.setattr(PPO, "__init__", fake_ppo_init)
+
+    config = _amp_config(discriminator_batch_size=4)
+    config.normalize_rewards = False
+
+    agent = AMP(fabric=object(), env=object(), config=config)
+
+    assert agent.num_envs * agent.num_steps == 6
+    assert agent.config.batch_size == 2
+    assert agent.config.amp_parameters.discriminator_batch_size == 4
+    assert agent.amp_component.running_reward_norm is None
+
+
 def test_amp_create_optimizers_wraps_discriminator_and_optional_disc_critic(
     monkeypatch,
 ):
@@ -1415,6 +1439,25 @@ def test_amp_discriminator_step_trains_against_expert_agent_and_replay_batches()
         expected_weight_total
         * agent.config.amp_parameters.discriminator_logit_weight_decay,
     )
+
+
+def test_amp_discriminator_step_uses_actual_minibatch_not_configured_upper_bound():
+    agent = _new_amp_agent()
+    agent.device = torch.device("cpu")
+    agent.config = _amp_config(discriminator_batch_size=4096)
+    agent.amp_component.discriminator = _ModuleWrapper(_LinearDiscriminator())
+    minibatch_size = 64
+    batch = {
+        "agent_disc_obs": torch.randn(minibatch_size, 2),
+        "replay_disc_obs": torch.randn(minibatch_size, 2),
+        "expert_disc_obs": torch.randn(minibatch_size, 2),
+    }
+
+    loss, log_dict = agent.amp_component.discriminator_step(batch)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(log_dict["discriminator/grad_penalty"])
+    assert log_dict["discriminator/expert_logit_mean"].ndim == 0
 
 
 def test_amp_component_accepts_explicit_negative_and_integer_expert_obs():

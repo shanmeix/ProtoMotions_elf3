@@ -40,7 +40,13 @@ class AMPParametersConfig:
     )
     discriminator_batch_size: int = field(
         default=4096,
-        metadata={"help": "Batch size for discriminator training.", "min": 1}
+        metadata={
+            "help": (
+                "Maximum discriminator samples per PPO minibatch; capped by "
+                "the available PPO minibatch size."
+            ),
+            "min": 1,
+        },
     )
     discriminator_grad_penalty: float = field(
         default=5.0,

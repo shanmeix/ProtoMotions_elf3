@@ -69,6 +69,138 @@ ELF3_JOINT_NAMES = [
 ]
 
 
+def convert_elf3_arrays_to_proto(
+    root_pos_np: np.ndarray,
+    root_quat_wxyz_np: np.ndarray,
+    joint_pos_np: np.ndarray,
+    output_file: Path,
+    fps: float,
+    mjcf_path: Path = ELF3_MJCF_PATH,
+    contact_velocity_threshold: float = 0.15,
+    contact_height_threshold: float = 0.1,
+    force_remake: bool = False,
+):
+    """Validate ELF3 pose arrays and save one ProtoMotions motion.
+
+    This is the common FK/velocity/contact pipeline used by the CSV and
+    TienKung-pickle frontends. Root quaternions must be in ``wxyz`` order and
+    joints must follow :data:`ELF3_JOINT_NAMES`.
+    """
+    output_file = Path(output_file).resolve()
+    mjcf_path = Path(mjcf_path).resolve()
+    if output_file.suffix != ".motion":
+        raise ValueError("output_file must end in .motion")
+    if output_file.exists() and not output_file.is_file():
+        raise IsADirectoryError(f"Output motion path is not a file: {output_file}")
+    if output_file.exists() and not force_remake:
+        raise FileExistsError(
+            f"{output_file} already exists; pass --force-remake to overwrite it."
+        )
+    if not mjcf_path.is_file():
+        raise FileNotFoundError(f"ELF3 MJCF file not found: {mjcf_path}")
+
+    source_fps = fps
+    try:
+        fps = float(source_fps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"fps must be a finite positive scalar; got {fps!r}.") from exc
+    if not np.isfinite(fps) or fps <= 0.0:
+        raise ValueError(f"fps must be a finite positive scalar; got {fps!r}.")
+    # Keep the legacy CSV output metadata as an int while allowing TienKung's
+    # measured non-integer sampling rates to pass through exactly.
+    if isinstance(source_fps, (int, np.integer)) and not isinstance(
+        source_fps, (bool, np.bool_)
+    ):
+        fps = int(source_fps)
+
+    root_pos_np = np.asarray(root_pos_np, dtype=np.float32)
+    root_quat_wxyz_np = np.asarray(root_quat_wxyz_np, dtype=np.float32)
+    joint_pos_np = np.asarray(joint_pos_np, dtype=np.float32)
+    if root_pos_np.ndim != 2 or root_pos_np.shape[1] != 3:
+        raise ValueError(f"root_pos must have shape (frames, 3); got {root_pos_np.shape}.")
+    num_frames = root_pos_np.shape[0]
+    if root_quat_wxyz_np.shape != (num_frames, 4):
+        raise ValueError(
+            "root quaternion must have shape "
+            f"({num_frames}, 4); got {root_quat_wxyz_np.shape}."
+        )
+    expected_joint_shape = (num_frames, len(ELF3_JOINT_NAMES))
+    if joint_pos_np.shape != expected_joint_shape:
+        raise ValueError(
+            f"joint_pos must have shape {expected_joint_shape}; got {joint_pos_np.shape}."
+        )
+    if num_frames < 2:
+        raise ValueError("At least two frames are required to compute velocities.")
+    if not (
+        np.isfinite(root_pos_np).all()
+        and np.isfinite(root_quat_wxyz_np).all()
+        and np.isfinite(joint_pos_np).all()
+    ):
+        raise ValueError("ELF3 pose arrays contain NaN or infinite values.")
+
+    quat_norm = np.linalg.norm(root_quat_wxyz_np, axis=-1, keepdims=True)
+    if np.any(quat_norm < 1.0e-8):
+        raise ValueError("ELF3 pose arrays contain a zero-length root quaternion.")
+    root_quat_wxyz_np = root_quat_wxyz_np / quat_norm
+
+    kinematic_info = extract_kinematic_info(str(mjcf_path))
+    if kinematic_info.dof_names != ELF3_JOINT_NAMES:
+        raise ValueError(
+            "ELF3 MJCF DOF order no longer matches the input contract:\n"
+            f"input: {ELF3_JOINT_NAMES}\nMJCF:  {kinematic_info.dof_names}"
+        )
+
+    root_pos = torch.from_numpy(root_pos_np)
+    root_quat_wxyz = torch.from_numpy(root_quat_wxyz_np)
+    joint_pos = torch.from_numpy(joint_pos_np)
+
+    lower = kinematic_info.dof_limits_lower.to(joint_pos)
+    upper = kinematic_info.dof_limits_upper.to(joint_pos)
+    tolerance = 1.0e-5
+    violations = (joint_pos < lower - tolerance) | (joint_pos > upper + tolerance)
+    if violations.any():
+        frame_idx, dof_idx = torch.nonzero(violations, as_tuple=False)[0].tolist()
+        raise ValueError(
+            f"Joint limit violation at output frame {frame_idx}, "
+            f"{ELF3_JOINT_NAMES[dof_idx]}={joint_pos[frame_idx, dof_idx].item():.6f}; "
+            f"expected [{lower[dof_idx].item():.6f}, {upper[dof_idx].item():.6f}]."
+        )
+
+    qpos = torch.cat([root_pos, root_quat_wxyz, joint_pos], dim=-1)
+    fk_root_pos, joint_rot_mats = extract_transforms_from_qpos(
+        kinematic_info,
+        qpos,
+    )
+    motion = fk_from_transforms_with_velocities(
+        kinematic_info=kinematic_info,
+        root_pos=fk_root_pos,
+        joint_rot_mats=joint_rot_mats,
+        fps=fps,
+        compute_velocities=True,
+        velocity_max_horizon=3,
+    )
+    motion.dof_pos = joint_pos
+    motion.dof_vel = compute_cartesian_velocity(
+        joint_pos.unsqueeze(1),
+        fps=fps,
+        velocity_max_horizon=1,
+    ).squeeze(1)
+    motion.rigid_body_contacts = compute_contact_labels_from_pos_and_vel(
+        positions=motion.rigid_body_pos,
+        velocity=motion.rigid_body_vel,
+        vel_thres=contact_velocity_threshold,
+        height_thresh=contact_height_threshold,
+    ).to(torch.bool)
+
+    # ELF3 has one hinge DOF per non-root body. MotionLib must not interpret
+    # these rotations as 3-DOF exponential-map joint data during interpolation.
+    motion.local_rigid_body_rot = None
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(motion.to_dict(), output_file)
+    return motion
+
+
 def load_elf3_csv(
     input_file: Path,
     ignore_first_n_frames: int,
@@ -150,68 +282,21 @@ def main(
             f"{output_file} already exists; pass --force-remake to overwrite it."
         )
 
-    kinematic_info = extract_kinematic_info(str(ELF3_MJCF_PATH))
-    if kinematic_info.dof_names != ELF3_JOINT_NAMES:
-        raise ValueError(
-            "ELF3 MJCF DOF order no longer matches the CSV contract:\n"
-            f"CSV:  {ELF3_JOINT_NAMES}\nMJCF: {kinematic_info.dof_names}"
-        )
-
     root_pos_np, root_quat_wxyz_np, joint_pos_np = load_elf3_csv(
         input_file,
         ignore_first_n_frames=ignore_first_n_frames,
     )
-    root_pos = torch.from_numpy(root_pos_np)
-    root_quat_wxyz = torch.from_numpy(root_quat_wxyz_np)
-    joint_pos = torch.from_numpy(joint_pos_np)
-
-    lower = kinematic_info.dof_limits_lower.to(joint_pos)
-    upper = kinematic_info.dof_limits_upper.to(joint_pos)
-    tolerance = 1.0e-5
-    if ((joint_pos < lower - tolerance) | (joint_pos > upper + tolerance)).any():
-        violating = torch.nonzero(
-            (joint_pos < lower - tolerance) | (joint_pos > upper + tolerance),
-            as_tuple=False,
-        )[0]
-        frame_idx, dof_idx = violating.tolist()
-        raise ValueError(
-            f"Joint limit violation at output frame {frame_idx}, "
-            f"{ELF3_JOINT_NAMES[dof_idx]}={joint_pos[frame_idx, dof_idx].item():.6f}; "
-            f"expected [{lower[dof_idx].item():.6f}, {upper[dof_idx].item():.6f}]."
-        )
-
-    qpos = torch.cat([root_pos, root_quat_wxyz, joint_pos], dim=-1)
-    fk_root_pos, joint_rot_mats = extract_transforms_from_qpos(
-        kinematic_info,
-        qpos,
-    )
-    motion = fk_from_transforms_with_velocities(
-        kinematic_info=kinematic_info,
-        root_pos=fk_root_pos,
-        joint_rot_mats=joint_rot_mats,
+    motion = convert_elf3_arrays_to_proto(
+        root_pos_np=root_pos_np,
+        root_quat_wxyz_np=root_quat_wxyz_np,
+        joint_pos_np=joint_pos_np,
+        output_file=output_file,
         fps=fps,
-        compute_velocities=True,
-        velocity_max_horizon=3,
+        mjcf_path=ELF3_MJCF_PATH,
+        contact_velocity_threshold=contact_velocity_threshold,
+        contact_height_threshold=contact_height_threshold,
+        force_remake=force_remake,
     )
-    motion.dof_pos = joint_pos
-    motion.dof_vel = compute_cartesian_velocity(
-        joint_pos.unsqueeze(1),
-        fps=fps,
-        velocity_max_horizon=1,
-    ).squeeze(1)
-    motion.rigid_body_contacts = compute_contact_labels_from_pos_and_vel(
-        positions=motion.rigid_body_pos,
-        velocity=motion.rigid_body_vel,
-        vel_thres=contact_velocity_threshold,
-        height_thresh=contact_height_threshold,
-    ).to(torch.bool)
-
-    # ELF3 has one hinge DOF per non-root body. MotionLib must not interpret
-    # these rotations as 3-DOF exponential-map joint data during interpolation.
-    motion.local_rigid_body_rot = None
-
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(motion.to_dict(), output_file)
 
     print(f"Converted {input_file}")
     print(f"  skipped frames:  {ignore_first_n_frames}")
