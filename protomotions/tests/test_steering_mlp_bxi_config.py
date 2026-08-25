@@ -14,6 +14,7 @@ from examples.experiments.steering import mlp_bxi
 from protomotions.components.terrains.config import CombineMode
 from protomotions.envs.action import bm_pd_action
 from protomotions.envs.terminations import fall_termination
+from protomotions.robot_configs.factory import robot_config as make_robot_config
 
 
 class _RobotConfig:
@@ -31,12 +32,12 @@ class _RobotConfig:
             hinge_axes_map={1: torch.tensor([[0.0, 0.0, 1.0]])},
             dof_limits_lower=torch.tensor([-1.0]),
             dof_limits_upper=torch.tensor([1.0]),
-            dof_names=["hinge"],
+            dof_names=["l_ankle_x_joint"],
             body_names=["torso", "left_foot", "right_foot"],
         )
         self.control = SimpleNamespace(
             control_info={
-                "hinge": SimpleNamespace(
+                "l_ankle_x_joint": SimpleNamespace(
                     stiffness=10.0,
                     damping=1.0,
                     effort_limit=20.0,
@@ -89,6 +90,50 @@ def test_bxi_overlay_reuses_generic_steering_data_factories():
     assert terrain_cfg.sim_config.combine_mode is CombineMode.MULTIPLY
 
 
+def test_real_bxi_action_scales_match_tienkung_locomotion_contract():
+    robot_cfg = make_robot_config("elf3_bxi")
+    env_cfg = mlp_bxi.env_config(robot_cfg, argparse.Namespace())
+
+    expected_scales = torch.tensor(
+        [
+            0.231,
+            0.154,
+            0.213,
+            0.213,
+            0.213,
+            0.231,
+            0.213,
+            0.373,
+            0.230,
+            0.213,
+            0.213,
+            0.231,
+            0.213,
+            0.373,
+            0.230,
+            0.231,
+            0.231,
+            0.373,
+            0.231,
+            0.373,
+            0.373,
+            0.373,
+            0.231,
+            0.231,
+            0.373,
+            0.231,
+            0.373,
+            0.373,
+            0.373,
+        ]
+    )
+    assert torch.allclose(
+        env_cfg.action_config["action_scale"],
+        expected_scales,
+        atol=6e-4,
+    )
+
+
 def test_bxi_env_uses_first_stage_commands_bm_actions_and_fall_termination():
     robot_cfg = _RobotConfig()
     env_cfg = mlp_bxi.env_config(robot_cfg, argparse.Namespace())
@@ -101,7 +146,66 @@ def test_bxi_env_uses_first_stage_commands_bm_actions_and_fall_termination():
     action_cfg = env_cfg.action_config
     assert action_cfg["fn"] is bm_pd_action
     assert torch.equal(action_cfg["pd_action_offset"], torch.tensor([0.25]))
-    assert torch.equal(action_cfg["action_scale"], torch.tensor([2.0]))
+    assert torch.equal(action_cfg["action_scale"], torch.tensor([0.5]))
+
+    rewards = env_cfg.reward_components
+    assert list(rewards) == [
+        "heading_rew",
+        "joint_pos_limits",
+        "pd_target_limits",
+        "ankle_action",
+        "ankle_torque",
+        "action_rate",
+        "feet_y_distance",
+        "zero_command_joint_deviation",
+    ]
+    assert rewards["joint_pos_limits"].get_bindings_dict()["dof_pos"] == (
+        "current.dof_pos"
+    )
+    assert rewards["joint_pos_limits"].static_params["weight"] == pytest.approx(
+        -0.2
+    )
+    assert torch.allclose(
+        rewards["joint_pos_limits"].static_params["dof_limits_lower"],
+        torch.tensor([-0.9]),
+    )
+    assert torch.allclose(
+        rewards["joint_pos_limits"].static_params["dof_limits_upper"],
+        torch.tensor([0.9]),
+    )
+    assert rewards["pd_target_limits"].get_bindings_dict()["dof_pos"] == (
+        "current_processed_action"
+    )
+    assert rewards["pd_target_limits"].static_params["weight"] == pytest.approx(
+        -0.5
+    )
+    assert rewards["ankle_action"].get_bindings_dict()["action"] == (
+        "current_action"
+    )
+    assert torch.equal(
+        rewards["ankle_action"].static_params["joint_indices"],
+        torch.tensor([0]),
+    )
+    assert rewards["ankle_torque"].get_bindings_dict()["dof_forces"] == (
+        "current.dof_forces"
+    )
+    assert rewards["ankle_torque"].static_params["use_torque_squared"] is True
+    assert rewards["action_rate"].get_bindings_dict() == {
+        "current_action": "current_action",
+        "previous_action": "previous_action",
+    }
+    assert rewards["feet_y_distance"].static_params[
+        "target_distance"
+    ] == pytest.approx(0.299)
+    assert rewards["feet_y_distance"].static_params[
+        "left_foot_body_index"
+    ] == 1
+    assert rewards["feet_y_distance"].static_params[
+        "right_foot_body_index"
+    ] == 2
+    assert rewards["zero_command_joint_deviation"].get_bindings_dict()[
+        "tar_face_dir"
+    ] == "steering.tar_face_dir"
 
     fall_cfg = env_cfg.termination_components["fall"]
     assert fall_cfg.compute_func is fall_termination
@@ -152,6 +256,53 @@ def test_bxi_env_uses_first_stage_commands_bm_actions_and_fall_termination():
         "steering",
         "historical_max_coords_obs",
     ]
+
+
+def test_bxi_regularization_components_execute_from_runtime_context():
+    env_cfg = mlp_bxi.env_config(_RobotConfig(), argparse.Namespace())
+    identity_rot = torch.tensor([[0.0, 0.0, 0.0, 1.0]] * 2)
+    rigid_body_pos = torch.zeros(2, 3, 3)
+    rigid_body_pos[:, 1, 1] = 0.1495
+    rigid_body_pos[:, 2, 1] = -0.1495
+    context = SimpleNamespace(
+        current=SimpleNamespace(
+            dof_pos=torch.zeros(2, 1),
+            dof_vel=torch.zeros(2, 1),
+            dof_forces=torch.ones(2, 1),
+            rigid_body_pos=rigid_body_pos,
+            anchor_rot=identity_rot,
+        ),
+        current_action=torch.full((2, 1), 0.2),
+        previous_action=torch.full((2, 1), 0.1),
+        current_processed_action=torch.full((2, 1), 0.95),
+        steering=SimpleNamespace(
+            tar_dir=torch.tensor([[1.0, 0.0]] * 2),
+            tar_speed=torch.zeros(2),
+            tar_face_dir=torch.tensor([[1.0, 0.0]] * 2),
+        ),
+    )
+
+    outputs = {
+        name: component.compute(context)
+        for name, component in env_cfg.reward_components.items()
+        if name != "heading_rew"
+    }
+    assert set(outputs) == {
+        "joint_pos_limits",
+        "pd_target_limits",
+        "ankle_action",
+        "ankle_torque",
+        "action_rate",
+        "feet_y_distance",
+        "zero_command_joint_deviation",
+    }
+    assert all(value.shape == (2,) for value in outputs.values())
+    assert all(torch.isfinite(value).all() for value in outputs.values())
+    assert torch.allclose(outputs["joint_pos_limits"], torch.zeros(2))
+    assert torch.allclose(outputs["pd_target_limits"], torch.full((2,), 0.05))
+    assert torch.allclose(
+        outputs["zero_command_joint_deviation"], torch.full((2,), 0.25)
+    )
 
 
 def test_bxi_training_inherits_robust_dr_and_enables_full_fall_sensing():

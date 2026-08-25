@@ -191,7 +191,7 @@ def test_make_pd_action_config_builds_normalized_action_config_from_robot_data()
     assert torch.equal(config["damping"], torch.tensor([1.0, 2.0, 4.0, 5.0, 10.0]))
 
 
-def test_make_bm_pd_action_config_uses_default_pose_and_effort_over_stiffness_scale():
+def test_make_bm_pd_action_config_uses_default_pose_and_quarter_effort_scale():
     robot_config = _mixed_dof_robot_config()
 
     config = make_bm_pd_action_config(robot_config)
@@ -200,7 +200,7 @@ def test_make_bm_pd_action_config_uses_default_pose_and_effort_over_stiffness_sc
     assert torch.equal(config["pd_action_offset"], robot_config.default_dof_pos)
     _assert_no_storage_alias(config["pd_action_offset"], robot_config.default_dof_pos)
     assert torch.allclose(
-        config["action_scale"], torch.tensor([10.0, 4.0, 1.5, 0.5, 0.1])
+        config["action_scale"], torch.tensor([2.5, 1.0, 0.375, 0.125, 0.025])
     )
     assert torch.equal(
         config["stiffness"], torch.tensor([10.0, 20.0, 40.0, 50.0, 100.0])

@@ -64,8 +64,13 @@ from protomotions.envs.rewards.task import (
 from protomotions.envs.rewards.regularization import (
     compute_action_smoothness,
     compute_action_smoothness_logmeanexp,
+    compute_action_rate_l2,
+    compute_action_l1,
     compute_pow_rew,
     compute_soft_pos_limit_rew,
+    compute_joint_deviation_l1,
+    compute_zero_command_joint_deviation_rew,
+    compute_feet_y_distance_rew,
     compute_contact_match_rew,
     compute_contact_force_change_rew,
     # Helper functions
@@ -114,8 +119,13 @@ __all__ = [
     # Regularization reward kernels
     "compute_action_smoothness",
     "compute_action_smoothness_logmeanexp",
+    "compute_action_rate_l2",
+    "compute_action_l1",
     "compute_pow_rew",
     "compute_soft_pos_limit_rew",
+    "compute_joint_deviation_l1",
+    "compute_zero_command_joint_deviation_rew",
+    "compute_feet_y_distance_rew",
     "compute_contact_match_rew",
     "compute_contact_force_change_rew",
     # Regularization helper functions

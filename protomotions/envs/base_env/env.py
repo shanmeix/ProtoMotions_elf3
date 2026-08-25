@@ -983,7 +983,10 @@ class BaseEnv:
             )
             if self.state_history
             else None,
-            # Actions (historical)
+            # Actions (current and historical)
+            current_action=self._select_context_tensor(
+                self._current_raw_action, env_ids
+            ),
             current_processed_action=self._select_context_tensor(
                 self._current_processed_action, env_ids
             ),

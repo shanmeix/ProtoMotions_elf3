@@ -215,6 +215,17 @@ def test_regularization_rewards_and_helpers():
         base.delta_logmeanexp(current_action, previous_action, beta=2.0),
     )
     assert torch.allclose(
+        regularization.compute_action_rate_l2(current_action, previous_action),
+        torch.tensor([4.0, 25.0]),
+    )
+    assert torch.allclose(
+        regularization.compute_action_l1(
+            current_action,
+            joint_indices=torch.tensor([1]),
+        ),
+        torch.tensor([3.0, 4.0]),
+    )
+    assert torch.allclose(
         regularization.compute_pow_rew(
             torch.tensor([[2.0, -3.0]]),
             torch.tensor([[10.0, -2.0]]),
@@ -230,6 +241,15 @@ def test_regularization_rewards_and_helpers():
         torch.tensor([13.0]),
     )
     assert torch.allclose(
+        regularization.compute_pow_rew(
+            torch.tensor([[2.0, -3.0]]),
+            torch.tensor([[10.0, -2.0]]),
+            use_torque_squared=True,
+            joint_indices=torch.tensor([1]),
+        ),
+        torch.tensor([9.0]),
+    )
+    assert torch.allclose(
         regularization.compute_soft_pos_limit_rew(dof_pos, lower, upper),
         torch.tensor([1.0, 2.0]),
     )
@@ -241,6 +261,49 @@ def test_regularization_rewards_and_helpers():
             indices=torch.tensor([0, 2]),
         ),
         torch.tensor([1.0, 1.0]),
+    )
+
+    identity_rot = torch.tensor(
+        [[0.0, 0.0, 0.0, 1.0]] * 3,
+        dtype=torch.float,
+    )
+    standing_dof_pos = torch.tensor([[1.0, -2.0]] * 3)
+    assert torch.allclose(
+        regularization.compute_joint_deviation_l1(
+            standing_dof_pos,
+            torch.zeros(2),
+            joint_indices=torch.tensor([1]),
+        ),
+        torch.tensor([2.0, 2.0, 2.0]),
+    )
+    assert torch.allclose(
+        regularization.compute_zero_command_joint_deviation_rew(
+            standing_dof_pos,
+            torch.zeros(2),
+            tar_speed=torch.tensor([0.0, 0.0, 0.2]),
+            anchor_rot=identity_rot,
+            tar_face_dir=torch.tensor(
+                [[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]
+            ),
+            joint_indices=torch.tensor([1]),
+        ),
+        torch.tensor([2.0, 0.0, 0.0]),
+    )
+
+    feet_pos = torch.zeros(3, 2, 3)
+    feet_pos[:, 0, 1] = torch.tensor([0.1495, 0.2, 0.2])
+    feet_pos[:, 1, 1] = torch.tensor([-0.1495, -0.2, -0.2])
+    assert torch.allclose(
+        regularization.compute_feet_y_distance_rew(
+            rigid_body_pos=feet_pos,
+            anchor_rot=identity_rot,
+            tar_dir=torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+            tar_speed=torch.ones(3),
+            left_foot_body_index=0,
+            right_foot_body_index=1,
+        ),
+        torch.tensor([0.0, 0.101, 0.0]),
+        atol=1e-6,
     )
 
     sim_contacts = torch.tensor([[True, False, True], [False, True, False]])

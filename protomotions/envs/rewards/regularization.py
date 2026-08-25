@@ -28,11 +28,18 @@ Includes:
 - Contact force change penalties
 """
 
-import torch
-from torch import Tensor
+import math
 from typing import Optional
 
-from protomotions.envs.rewards.base import power_consumption_sum, delta_norm, delta_logmeanexp
+import torch
+from torch import Tensor
+
+from protomotions.envs.rewards.base import (
+    delta_logmeanexp,
+    delta_norm,
+    power_consumption_sum,
+)
+from protomotions.utils import rotations
 
 
 # =============================================================================
@@ -81,10 +88,33 @@ def compute_action_smoothness_logmeanexp(
     )
 
 
+def compute_action_rate_l2(
+    current_action: Tensor,
+    previous_action: Tensor,
+    joint_indices: Optional[Tensor] = None,
+) -> Tensor:
+    """Squared raw-action change, matching the TienKung locomotion penalty."""
+    action_delta = current_action - previous_action
+    if joint_indices is not None:
+        action_delta = action_delta[:, joint_indices]
+    return torch.sum(torch.square(action_delta), dim=-1)
+
+
+def compute_action_l1(
+    action: Tensor,
+    joint_indices: Optional[Tensor] = None,
+) -> Tensor:
+    """Sum absolute raw actions, optionally over a selected joint subset."""
+    if joint_indices is not None:
+        action = action[:, joint_indices]
+    return torch.sum(torch.abs(action), dim=-1)
+
+
 def compute_pow_rew(
     dof_forces: Tensor,
     dof_vel: Tensor,
     use_torque_squared: bool = False,
+    joint_indices: Optional[Tensor] = None,
 ) -> Tensor:
     """Power consumption reward.
     
@@ -92,11 +122,17 @@ def compute_pow_rew(
         dof_forces: Joint forces/torques [num_envs, num_dofs].
         dof_vel: Joint velocities [num_envs, num_dofs].
         use_torque_squared: Whether to use torque squared instead of absolute.
+        joint_indices: Optional joint subset to include.
     
     Returns:
         Power consumption tensor [num_envs].
     """
-    return power_consumption_sum(dof_forces, dof_vel, use_torque_squared)
+    return power_consumption_sum(
+        dof_forces,
+        dof_vel,
+        use_torque_squared,
+        indices=joint_indices,
+    )
 
 
 def compute_soft_pos_limit_rew(
@@ -133,6 +169,82 @@ def compute_soft_pos_limit_rew(
     if max_violation is not None:
         total = total.clip(max=max_violation)
     return total
+
+
+def compute_joint_deviation_l1(
+    dof_pos: Tensor,
+    default_dof_pos: Tensor,
+    joint_indices: Optional[Tensor] = None,
+) -> Tensor:
+    """L1 joint deviation from a fixed default pose."""
+    deviation = dof_pos - default_dof_pos
+    if joint_indices is not None:
+        deviation = deviation[:, joint_indices]
+    return torch.sum(torch.abs(deviation), dim=-1)
+
+
+def compute_zero_command_joint_deviation_rew(
+    dof_pos: Tensor,
+    default_dof_pos: Tensor,
+    tar_speed: Tensor,
+    anchor_rot: Tensor,
+    tar_face_dir: Tensor,
+    joint_indices: Optional[Tensor] = None,
+    speed_threshold: float = 0.1,
+    facing_tolerance: float = 0.2,
+) -> Tensor:
+    """Default-pose deviation when stopped and already facing the command.
+
+    Steering can request an in-place heading change while target speed is zero.
+    The facing gate avoids fighting that maneuver with a standing-pose penalty.
+    """
+    deviation = compute_joint_deviation_l1(
+        dof_pos,
+        default_dof_pos,
+        joint_indices=joint_indices,
+    )
+    face_dir_3d = torch.cat(
+        [tar_face_dir, torch.zeros_like(tar_face_dir[..., :1])], dim=-1
+    )
+    heading_inv = rotations.calc_heading_quat_inv(anchor_rot, w_last=True)
+    local_face_dir = rotations.quat_rotate(heading_inv, face_dir_3d, w_last=True)
+    stopped = torch.abs(tar_speed) < speed_threshold
+    facing_aligned = local_face_dir[..., 0] > math.cos(facing_tolerance)
+    active = torch.logical_and(stopped, facing_aligned).to(deviation.dtype)
+    return deviation * active
+
+
+def compute_feet_y_distance_rew(
+    rigid_body_pos: Tensor,
+    anchor_rot: Tensor,
+    tar_dir: Tensor,
+    tar_speed: Tensor,
+    left_foot_body_index: int,
+    right_foot_body_index: int,
+    target_distance: float = 0.299,
+    lateral_speed_threshold: float = 0.1,
+) -> Tensor:
+    """Foot lateral-spacing error when little sideways motion is commanded."""
+    heading_inv = rotations.calc_heading_quat_inv(anchor_rot, w_last=True)
+
+    feet_delta = (
+        rigid_body_pos[:, left_foot_body_index]
+        - rigid_body_pos[:, right_foot_body_index]
+    )
+    local_feet_delta = rotations.quat_rotate(
+        heading_inv, feet_delta, w_last=True
+    )
+    lateral_distance = torch.abs(local_feet_delta[..., 1])
+
+    tar_dir_3d = torch.cat(
+        [tar_dir, torch.zeros_like(tar_dir[..., :1])], dim=-1
+    )
+    local_tar_dir = rotations.quat_rotate(
+        heading_inv, tar_dir_3d, w_last=True
+    )
+    lateral_speed = torch.abs(local_tar_dir[..., 1] * tar_speed)
+    active = (lateral_speed < lateral_speed_threshold).to(lateral_distance.dtype)
+    return torch.abs(lateral_distance - target_distance) * active
 
 
 def compute_contact_match_rew(
@@ -270,8 +382,13 @@ __all__ = [
     # Main reward kernels
     "compute_action_smoothness",
     "compute_action_smoothness_logmeanexp",
+    "compute_action_rate_l2",
+    "compute_action_l1",
     "compute_pow_rew",
     "compute_soft_pos_limit_rew",
+    "compute_joint_deviation_l1",
+    "compute_zero_command_joint_deviation_rew",
+    "compute_feet_y_distance_rew",
     "compute_contact_match_rew",
     "compute_contact_force_change_rew",
     # Helper functions

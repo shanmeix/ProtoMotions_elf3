@@ -359,10 +359,10 @@ def bm_pd_action(
 def make_bm_pd_action_config(robot_config) -> Dict[str, Any]:
     """Create action config dict for BeyondMimic-style PD action scaling.
 
-    Computes per-joint action scale as ``effort_limit / stiffness``,
-    which normalizes the policy output so ~O(1) values map to ~ the
-    maximum achievable deflection per joint. Uses ``robot_config.default_dof_pos``
-    as the action offset (default standing pose).
+    Computes per-joint action scale as ``0.25 * effort_limit / stiffness``,
+    so ~O(1) policy outputs map to 25% of the maximum torque-equivalent
+    deflection per joint. Uses ``robot_config.default_dof_pos`` as the action
+    offset (default standing pose).
 
     Args:
         robot_config: Robot configuration with kinematic_info, control, and
@@ -391,7 +391,7 @@ def make_bm_pd_action_config(robot_config) -> Dict[str, Any]:
     if torch.any(stiffness <= 0):
         raise ValueError("BM PD action stiffness must be positive for all joints")
 
-    action_scale = effort_limit / stiffness
+    action_scale = 0.25 * effort_limit / stiffness
 
     pd_action_offset = robot_config.default_dof_pos.clone()
 

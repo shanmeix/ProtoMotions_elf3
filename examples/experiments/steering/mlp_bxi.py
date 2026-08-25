@@ -11,12 +11,15 @@ that are specific to the BXI locomotion training/deployment contract:
 * the deployment-aligned BeyondMimic PD action mapping;
 * deployment-observable actor inputs with training-time sensor noise;
 * the robust reset/domain-randomization setup already used by BXI mimic;
-* a first-stage command distribution covered by the TienKung motion set; and
+* a first-stage command distribution covered by the TienKung motion set;
+* TienKung-derived joint, ankle, smoothness, and stance regularization; and
 * fall termination during training, removed again for inference.
 """
 
 import argparse
 import math
+
+import torch
 
 from examples.experiments.mimic import mlp_bm_l2c2 as _robustness
 from examples.experiments.mimic import mlp_bm_l2c2_bxi as _bxi
@@ -45,6 +48,24 @@ BXI_CONTROL_DT = BXI_CONTROL_DECIMATION / BXI_PHYSICS_FPS
 BXI_TAR_SPEED_MIN = 0.0
 BXI_TAR_SPEED_MAX = 1.5
 BXI_FALL_TERMINATION_HEIGHT = 0.2
+
+# TienKung locomotion regularization, expressed as ProtoMotions reward terms.
+# Keep these experiment-local: generic Steering intentionally stays
+# robot-agnostic, while the ankle/stance terms below rely on ELF3 semantics.
+BXI_SOFT_JOINT_LIMIT_FACTOR = 0.9
+BXI_LIMIT_MAX_VIOLATION = 1.0
+# TienKung's positive tracking terms total roughly 10, versus Steering's
+# unit-scale task reward. Start its negative terms at one tenth strength.
+BXI_JOINT_POS_LIMIT_WEIGHT = -0.2
+BXI_PD_TARGET_LIMIT_WEIGHT = -0.5
+BXI_ANKLE_ACTION_WEIGHT = -0.0001
+BXI_ANKLE_TORQUE_WEIGHT = -0.00005
+BXI_ACTION_RATE_WEIGHT = -0.001
+BXI_FEET_Y_DISTANCE_WEIGHT = -0.2
+BXI_ZERO_COMMAND_JOINT_DEVIATION_WEIGHT = -0.002
+BXI_FEET_Y_TARGET_DISTANCE = 0.299
+BXI_COMMAND_SPEED_THRESHOLD = 0.1
+BXI_FACING_TOLERANCE = 0.2
 
 # The data loaders do not need BXI-specific copies.
 scene_lib_config = _base.scene_lib_config
@@ -88,6 +109,173 @@ def _steering_obs_component(*, use_noisy: bool):
     )
 
 
+def _soft_joint_limits(robot_cfg: RobotConfig):
+    """Shrink hard limits about their midpoint to the TienKung 90% range."""
+
+    soft_limit_factor = getattr(
+        robot_cfg.control,
+        "soft_pos_limit",
+        BXI_SOFT_JOINT_LIMIT_FACTOR,
+    )
+    if not 0.0 < soft_limit_factor <= 1.0:
+        raise ValueError(
+            "elf3_bxi Steering soft joint limit factor must be in (0, 1], "
+            f"got {soft_limit_factor}"
+        )
+    hard_lower = robot_cfg.kinematic_info.dof_limits_lower
+    hard_upper = robot_cfg.kinematic_info.dof_limits_upper
+    midpoint = 0.5 * (hard_lower + hard_upper)
+    half_range = 0.5 * soft_limit_factor * (hard_upper - hard_lower)
+    return midpoint - half_range, midpoint + half_range
+
+
+def _ankle_joint_indices(robot_cfg: RobotConfig) -> torch.Tensor:
+    indices = [
+        index
+        for index, name in enumerate(robot_cfg.kinematic_info.dof_names)
+        if name.endswith(("_ankle_y_joint", "_ankle_x_joint"))
+    ]
+    if not indices:
+        raise ValueError("elf3_bxi Steering could not resolve ankle joint indices")
+    return torch.tensor(indices, dtype=torch.long)
+
+
+def _single_semantic_body_index(robot_cfg: RobotConfig, semantic_name: str) -> int:
+    body_names = robot_cfg.common_naming_to_robot_body_names[semantic_name]
+    if len(body_names) != 1:
+        raise ValueError(
+            f"elf3_bxi Steering requires one body for {semantic_name!r}, "
+            f"got {body_names!r}"
+        )
+    try:
+        return robot_cfg.kinematic_info.body_names.index(body_names[0])
+    except ValueError as exc:
+        raise ValueError(
+            f"elf3_bxi Steering body {body_names[0]!r} from {semantic_name!r} "
+            "is absent from the robot asset"
+        ) from exc
+
+
+def _regularization_reward_components(robot_cfg: RobotConfig):
+    """Build the safety and stance costs retained from TienKung locomotion."""
+
+    from protomotions.envs.context_views import EnvContext
+    from protomotions.envs.mdp_component import MdpComponent
+    from protomotions.envs.rewards import (
+        compute_action_l1,
+        compute_action_rate_l2,
+        compute_feet_y_distance_rew,
+        compute_pow_rew,
+        compute_soft_pos_limit_rew,
+        compute_zero_command_joint_deviation_rew,
+    )
+
+    soft_lower, soft_upper = _soft_joint_limits(robot_cfg)
+    ankle_indices = _ankle_joint_indices(robot_cfg)
+    left_foot_index = _single_semantic_body_index(
+        robot_cfg, "all_left_foot_bodies"
+    )
+    right_foot_index = _single_semantic_body_index(
+        robot_cfg, "all_right_foot_bodies"
+    )
+
+    return {
+        # Actual joint state must stay inside a 90%-of-hard-range envelope.
+        "joint_pos_limits": MdpComponent(
+            compute_func=compute_soft_pos_limit_rew,
+            dynamic_vars={"dof_pos": EnvContext.current.dof_pos},
+            static_params={
+                "weight": BXI_JOINT_POS_LIMIT_WEIGHT,
+                "dof_limits_lower": soft_lower,
+                "dof_limits_upper": soft_upper,
+                "max_violation": BXI_LIMIT_MAX_VIOLATION,
+            },
+        ),
+        # Penalize the command itself as well: a hard stop can keep q legal
+        # while an out-of-range PD target still requests saturated torque.
+        "pd_target_limits": MdpComponent(
+            compute_func=compute_soft_pos_limit_rew,
+            dynamic_vars={
+                "dof_pos": EnvContext.current_processed_action,
+            },
+            static_params={
+                "weight": BXI_PD_TARGET_LIMIT_WEIGHT,
+                "dof_limits_lower": soft_lower,
+                "dof_limits_upper": soft_upper,
+                "max_violation": BXI_LIMIT_MAX_VIOLATION,
+            },
+        ),
+        "ankle_action": MdpComponent(
+            compute_func=compute_action_l1,
+            dynamic_vars={"action": EnvContext.current_action},
+            static_params={
+                "weight": BXI_ANKLE_ACTION_WEIGHT,
+                "joint_indices": ankle_indices,
+                "min_value": -0.1,
+                "zero_during_grace_period": True,
+            },
+        ),
+        "ankle_torque": MdpComponent(
+            compute_func=compute_pow_rew,
+            dynamic_vars={
+                "dof_forces": EnvContext.current.dof_forces,
+                "dof_vel": EnvContext.current.dof_vel,
+            },
+            static_params={
+                "weight": BXI_ANKLE_TORQUE_WEIGHT,
+                "use_torque_squared": True,
+                "joint_indices": ankle_indices,
+                "min_value": -0.5,
+                "zero_during_grace_period": True,
+            },
+        ),
+        "action_rate": MdpComponent(
+            compute_func=compute_action_rate_l2,
+            dynamic_vars={
+                "current_action": EnvContext.current_action,
+                "previous_action": EnvContext.previous_action,
+            },
+            static_params={
+                "weight": BXI_ACTION_RATE_WEIGHT,
+                "min_value": -0.25,
+                "zero_during_grace_period": True,
+            },
+        ),
+        "feet_y_distance": MdpComponent(
+            compute_func=compute_feet_y_distance_rew,
+            dynamic_vars={
+                "rigid_body_pos": EnvContext.current.rigid_body_pos,
+                "anchor_rot": EnvContext.current.anchor_rot,
+                "tar_dir": EnvContext.steering.tar_dir,
+                "tar_speed": EnvContext.steering.tar_speed,
+            },
+            static_params={
+                "weight": BXI_FEET_Y_DISTANCE_WEIGHT,
+                "left_foot_body_index": left_foot_index,
+                "right_foot_body_index": right_foot_index,
+                "target_distance": BXI_FEET_Y_TARGET_DISTANCE,
+                "lateral_speed_threshold": BXI_COMMAND_SPEED_THRESHOLD,
+                "zero_during_grace_period": True,
+            },
+        ),
+        "zero_command_joint_deviation": MdpComponent(
+            compute_func=compute_zero_command_joint_deviation_rew,
+            dynamic_vars={
+                "dof_pos": EnvContext.current.dof_pos,
+                "tar_speed": EnvContext.steering.tar_speed,
+                "anchor_rot": EnvContext.current.anchor_rot,
+                "tar_face_dir": EnvContext.steering.tar_face_dir,
+            },
+            static_params={
+                "weight": BXI_ZERO_COMMAND_JOINT_DEVIATION_WEIGHT,
+                "default_dof_pos": robot_cfg.default_dof_pos,
+                "speed_threshold": BXI_COMMAND_SPEED_THRESHOLD,
+                "facing_tolerance": BXI_FACING_TOLERANCE,
+            },
+        ),
+    }
+
+
 def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     """Apply the BXI command curriculum, action mapping, and fall reset."""
 
@@ -123,6 +311,10 @@ def env_config(robot_cfg: RobotConfig, args: argparse.Namespace) -> EnvConfig:
     )
 
     env_cfg.action_config = make_bm_pd_action_config(robot_cfg)
+    env_cfg.reward_components = {
+        **env_cfg.reward_components,
+        **_regularization_reward_components(robot_cfg),
+    }
     env_cfg.termination_components = {
         **env_cfg.termination_components,
         "fall": fall_termination_factory(
@@ -303,6 +495,18 @@ __all__ = (
     "BXI_TAR_SPEED_MIN",
     "BXI_TAR_SPEED_MAX",
     "BXI_FALL_TERMINATION_HEIGHT",
+    "BXI_SOFT_JOINT_LIMIT_FACTOR",
+    "BXI_LIMIT_MAX_VIOLATION",
+    "BXI_JOINT_POS_LIMIT_WEIGHT",
+    "BXI_PD_TARGET_LIMIT_WEIGHT",
+    "BXI_ANKLE_ACTION_WEIGHT",
+    "BXI_ANKLE_TORQUE_WEIGHT",
+    "BXI_ACTION_RATE_WEIGHT",
+    "BXI_FEET_Y_DISTANCE_WEIGHT",
+    "BXI_ZERO_COMMAND_JOINT_DEVIATION_WEIGHT",
+    "BXI_FEET_Y_TARGET_DISTANCE",
+    "BXI_COMMAND_SPEED_THRESHOLD",
+    "BXI_FACING_TOLERANCE",
     "terrain_config",
     "scene_lib_config",
     "motion_lib_config",

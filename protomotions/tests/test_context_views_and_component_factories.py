@@ -220,6 +220,7 @@ def test_control_contexts_and_env_context_store_optional_views():
         current=current,
         noisy=current,
         dt=1.0 / 60.0,
+        current_action=torch.ones(2, 5) * 0.5,
         previous_action=torch.ones(2, 5),
         current_processed_action=torch.ones(2, 5) * 2.0,
         previous_processed_action=torch.ones(2, 5) * 3.0,
@@ -246,6 +247,7 @@ def test_control_contexts_and_env_context_store_optional_views():
         masked.time_offsets, torch.arange(8, dtype=torch.float).reshape(2, 4)
     )
     assert env_context.masked_mimic.mimic is mimic
+    assert torch.equal(env_context.current_action, torch.ones(2, 5) * 0.5)
     assert env_context.steering.tar_speed.tolist() == [3.0, 3.0]
     assert env_context.path.height_conditioned is True
     assert env_context.target.tar_proximity_threshold == 0.5

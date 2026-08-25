@@ -590,7 +590,8 @@ class EnvContext:
     historical: Optional[HistoricalView] = NestedField(HistoricalView)
     noisy_historical: Optional[HistoricalView] = NestedField(HistoricalView)
 
-    # Actions (historical)
+    # Actions (current and historical)
+    current_action: Optional[Tensor] = FieldPath()
     previous_action: Optional[Tensor] = FieldPath()
     current_processed_action: Optional[Tensor] = FieldPath()
     previous_processed_action: Optional[Tensor] = FieldPath()
@@ -645,6 +646,7 @@ class EnvContext:
         dt: float,
         historical: Optional[HistoricalView] = None,
         noisy_historical: Optional[HistoricalView] = None,
+        current_action: Optional[Tensor] = None,
         previous_action: Optional[Tensor] = None,
         current_processed_action: Optional[Tensor] = None,
         previous_processed_action: Optional[Tensor] = None,
@@ -679,6 +681,7 @@ class EnvContext:
             dt: Simulation timestep in seconds.
             historical: Clean historical state view (optional).
             noisy_historical: Noisy historical state view (optional).
+            current_action: Current raw action [num_envs, action_dim] (optional).
             previous_action: Previous raw action [num_envs, action_dim] (optional).
             current_processed_action: Current processed action (optional).
             previous_processed_action: Previous processed action (optional).
@@ -711,6 +714,7 @@ class EnvContext:
         self.noisy_historical = noisy_historical
 
         # Actions
+        self.current_action = current_action
         self.previous_action = previous_action
         self.current_processed_action = current_processed_action
         self.previous_processed_action = previous_processed_action

@@ -672,9 +672,9 @@ def export_tracker(
     # The action -> PD target conversion, read from this run's own action config.
     # Not cosmetic metadata: the graph computes
     #     joint_pos_targets = pd_action_offset + action_scale * action
-    # and a policy distilled from an FSQ decoder uses an action_scale a quarter of
-    # a normal tracker's, because its decoder was trained at that scale. Without
-    # these fields the two exports produce byte-identical-looking sidecars.
+    # Different checkpoints may have been trained with different action scales;
+    # without these fields their sidecars would hide that control-contract
+    # difference even though their runtime targets are not interchangeable.
     def _as_float_list(v):
         if v is None:
             return None
